@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from flask import current_app
 import pytz
 from amber import AmberClient
-from models import db, Interval, UserConfig
+from models import db, Interval, Agg, UserConfig
 from collections import defaultdict
 
 AEST = pytz.timezone("Australia/Sydney")
@@ -59,10 +59,27 @@ def _fetch_chunk(client, site_id, start, end, channel):
     return data or []
 
 
+def _update_aggregates():
+    """Aggregate all Interval data into Agg (daily totals)."""
+    print("[Amber] Updating aggregate daily totals…")
+    db.session.query(Agg).delete()
+    daily = defaultdict(lambda: dict(imp=0.0, exp=0.0, cost=0.0))
+    for i in Interval.query.all():
+        d = i.ts.date()
+        daily[d]["imp"] += i.import_kwh
+        daily[d]["exp"] += i.export_kwh
+        daily[d]["cost"] += i.cost
+    for d, vals in sorted(daily.items()):
+        agg = Agg(date=d, import_kwh=vals["imp"], export_kwh=vals["exp"], cost=vals["cost"])
+        db.session.add(agg)
+    db.session.commit()
+    print(f"[Amber] Aggregated {len(daily)} days into Agg table.")
+
+
 def pull_once(user=None):
     """
     Pull Amber usage for import (general) and feedIn (export),
-    respecting Amber’s 7-day range limit.
+    respecting Amber’s 7-day range limit, then update aggregates.
     """
     try:
         if user is None:
@@ -86,13 +103,11 @@ def pull_once(user=None):
             return {"status": "no-site"}
 
         end_date = datetime.utcnow().date()
-        start_date = end_date - timedelta(days=14)  # 2 weeks total (split into 7-day chunks)
-
+        start_date = end_date - timedelta(days=14)  # pull 2 weeks, 7-day chunks
         print(f"[Amber] Fetching site {site_id} from {start_date} to {end_date} (max 7-day chunks)")
 
         combined = defaultdict(lambda: dict(imp=0.0, exp=0.0, imp_p=0.0, exp_p=0.0))
         day = start_date
-
         while day < end_date:
             chunk_end = min(day + timedelta(days=7), end_date)
             for ch in ["general", "feedIn"]:
@@ -120,18 +135,9 @@ def pull_once(user=None):
         db.session.commit()
         print(f"[Amber] Stored {count} half-hour intervals ({start_date}→{end_date})")
 
-        # Summarize daily totals
-        daily = defaultdict(lambda: dict(imp=0.0, exp=0.0, cost=0.0))
-        for ts, v in combined.items():
-            d = ts.date()
-            daily[d]["imp"] += v["imp"]
-            daily[d]["exp"] += v["exp"]
-            daily[d]["cost"] += (v["imp"] * v["imp_p"] / 100.0) + (v["exp"] * v["exp_p"] / 100.0)
+        _update_aggregates()
 
-        print("=== Daily Totals ===")
-        for d, vals in sorted(daily.items()):
-            print(f"{d}: Import {vals['imp']:.2f} kWh, Export {vals['exp']:.2f} kWh, Net ${vals['cost']:.2f}")
-
+        print("[Amber] Pull complete.")
         return {"status": "ok", "count": count}
 
     except Exception as e:
