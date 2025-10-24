@@ -9,7 +9,6 @@ app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///amber.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db.init_app(app)
 
-
 # --- Initialize database safely for Flask 3.x ---
 with app.app_context():
     db.create_all()
@@ -24,26 +23,26 @@ def index():
     # Latest 48 intervals (~24 hours)
     intervals = Interval.query.order_by(Interval.ts.desc()).limit(48).all()
 
+    # Daily aggregation
     daily = (
         db.session.query(
             db.func.date(Interval.ts).label("day"),
-            db.func.sum(Interval.kwh_import).label("import_kwh"),
-            db.func.sum(Interval.kwh_export).label("export_kwh"),
-            db.func.sum(Interval.cost_import).label("import_cost"),
-            db.func.sum(Interval.cost_export).label("export_credit"),
+            db.func.sum(Interval.import_kwh).label("import_kwh"),
+            db.func.sum(Interval.export_kwh).label("export_kwh"),
+            db.func.sum(Interval.cost).label("net_cost"),
         )
         .group_by(db.func.date(Interval.ts))
         .order_by(db.func.date(Interval.ts).desc())
         .all()
     )
 
+    # Monthly aggregation
     monthly = (
         db.session.query(
             db.func.strftime("%Y-%m", Interval.ts).label("month"),
-            db.func.sum(Interval.kwh_import).label("import_kwh"),
-            db.func.sum(Interval.kwh_export).label("export_kwh"),
-            db.func.sum(Interval.cost_import).label("import_cost"),
-            db.func.sum(Interval.cost_export).label("export_credit"),
+            db.func.sum(Interval.import_kwh).label("import_kwh"),
+            db.func.sum(Interval.export_kwh).label("export_kwh"),
+            db.func.sum(Interval.cost).label("net_cost"),
         )
         .group_by(db.func.strftime("%Y-%m", Interval.ts))
         .order_by(db.func.strftime("%Y-%m", Interval.ts).desc())
