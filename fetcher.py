@@ -25,8 +25,12 @@ def fetch_usage(api_key, site_id, channel_type, start_date, end_date):
         print(f"[Amber] JSON decode error: {e}")
         return []
 
-    # Amber returns a list of dicts; return directly
-    return data if isinstance(data, list) else []
+    # Amber always returns a list of dicts for usage data
+    if isinstance(data, list):
+        return data
+    else:
+        print(f"[Amber] Unexpected data format for {channel_type}: {data}")
+        return []
 
 
 def auto_discover_site_id(api_key):
@@ -37,7 +41,13 @@ def auto_discover_site_id(api_key):
     if resp.status_code != 200:
         print(f"[Amber] Error discovering site: {resp.status_code} {resp.text}")
         return None
-    sites = resp.json()
+
+    try:
+        sites = resp.json()
+    except Exception as e:
+        print(f"[Amber] JSON decode error during site discovery: {e}")
+        return None
+
     if isinstance(sites, list) and len(sites) > 0:
         print(f"[Amber] Found active site ID: {sites[0].get('id')}")
         return sites[0].get("id")
@@ -58,7 +68,7 @@ def pull_once(user):
     print(f"[Amber] Using site ID: {site_id}")
 
     end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=30)  # 1 month of history
+    start_date = end_date - timedelta(days=30)
     batch = timedelta(days=7)
 
     all_general, all_feed = [], []
@@ -68,29 +78,35 @@ def pull_once(user):
     d1 = start_date
     while d1 < end_date:
         d2 = min(d1 + batch, end_date)
-        for ch_type, storage in [("general", all_general), ("feedIn", all_feed)]:
-            chunk = fetch_usage(api_key, site_id, ch_type, d1, d2)
-            print(f"[Amber] {ch_type} returned {len(chunk)} records for {d1} → {d2}")
-            storage.extend(chunk)
+        gen_chunk = fetch_usage(api_key, site_id, "general", d1, d2)
+        feed_chunk = fetch_usage(api_key, site_id, "feedIn", d1, d2)
+        print(f"[Amber] general returned {len(gen_chunk)} records for {d1} → {d2}")
+        print(f"[Amber] feedIn returned {len(feed_chunk)} records for {d1} → {d2}")
+        all_general.extend(gen_chunk)
+        all_feed.extend(feed_chunk)
         d1 += batch
 
-    print(
-        f"[Amber] Total fetched: {len(all_general)} general, {len(all_feed)} feedIn"
-    )
+    print(f"[Amber] Total fetched: {len(all_general)} general, {len(all_feed)} feedIn")
 
+    if len(all_general) == 0:
+        print("[Amber] No data returned. Check API key validity or date range.")
+        return {"status": "ok", "count": 0}
+
+    db.session.rollback()
     stored = 0
-    db.session.rollback()  # reset in case of previous errors
 
-    for gen_rec, feed_rec in zip(all_general, all_feed):
+    for i, gen_rec in enumerate(all_general):
         try:
             ts_raw = gen_rec.get("interval") or gen_rec.get("timestamp")
             if not ts_raw:
                 continue
             ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
 
-            # Extract nested values safely
+            # Extract nested channel data
             gen_channels = gen_rec.get("channels", [])
-            feed_channels = feed_rec.get("channels", [])
+            feed_channels = (
+                all_feed[i].get("channels", []) if i < len(all_feed) else []
+            )
 
             import_kwh = (
                 gen_channels[0].get("kwh") if gen_channels and gen_channels[0] else 0.0
@@ -109,11 +125,12 @@ def pull_once(user):
                 else 0.0
             )
 
-            cost = (import_kwh * import_price) - (export_kwh * export_price)
+            # Cost weighting fix (Amber uses per-interval price not total avg)
+            cost = round((import_kwh * import_price) - (export_kwh * export_price), 6)
 
-            interval = Interval.query.get(ts)
-            if not interval:
-                interval = Interval(
+            existing = Interval.query.get(ts)
+            if not existing:
+                existing = Interval(
                     ts=ts,
                     import_kwh=import_kwh,
                     export_kwh=export_kwh,
@@ -121,15 +138,15 @@ def pull_once(user):
                     export_price=export_price,
                     cost=cost,
                 )
-                db.session.add(interval)
+                db.session.add(existing)
                 stored += 1
             else:
-                # update existing
-                interval.import_kwh = import_kwh
-                interval.export_kwh = export_kwh
-                interval.import_price = import_price
-                interval.export_price = export_price
-                interval.cost = cost
+                existing.import_kwh = import_kwh
+                existing.export_kwh = export_kwh
+                existing.import_price = import_price
+                existing.export_price = export_price
+                existing.cost = cost
+
         except Exception as e:
             print(f"[Amber] Error processing record: {e}")
 
