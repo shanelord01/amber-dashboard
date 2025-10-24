@@ -1,6 +1,6 @@
 from flask import Flask, render_template, request, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
-from datetime import datetime, timedelta
+from datetime import datetime
 from models import db, Interval, UserConfig
 from fetcher import pull_once
 
@@ -9,13 +9,15 @@ app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///amber.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db.init_app(app)
 
-@app.before_first_request
-def init_db():
+
+# --- Initialize database safely for Flask 3.x ---
+with app.app_context():
     db.create_all()
     if not UserConfig.query.get(1):
         user = UserConfig(id=1, api_key="", site_id=None)
         db.session.add(user)
         db.session.commit()
+
 
 @app.route("/")
 def index():
@@ -57,6 +59,7 @@ def index():
         user=user,
     )
 
+
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
     user = UserConfig.query.get(1)
@@ -67,12 +70,14 @@ def settings():
         return redirect(url_for("index"))
     return render_template("settings.html", user=user)
 
+
 @app.route("/pull")
 def pull():
     user = UserConfig.query.get(1)
     result = pull_once(user)
     print(result)
     return redirect(url_for("index"))
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
