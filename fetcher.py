@@ -2,14 +2,14 @@ from datetime import datetime, timedelta
 from flask import current_app
 import pytz
 from amber import AmberClient
-from models import db, Interval, Agg, UserConfig
+from models import db, Interval, UserConfig
 from collections import defaultdict
 
 AEST = pytz.timezone("Australia/Sydney")
 
 
 def _parse_ts(val):
-    """Parse Amber timestamp to AEST datetime."""
+    """Parse Amber timestamps safely to AEST datetimes."""
     if not val:
         return None
     try:
@@ -21,12 +21,12 @@ def _parse_ts(val):
             return dt.astimezone(AEST)
         return val.astimezone(AEST)
     except Exception as e:
-        print(f"[Amber] Timestamp parse failed for {val}: {e}")
+        print(f"[Amber] Failed to parse timestamp {val}: {e}")
         return None
 
 
 def upsert(ts, imp, exp, imp_price, exp_price):
-    """Store or update a 30-minute interval."""
+    """Insert or update a 30-min interval row."""
     if not ts:
         return
     row = Interval.query.filter_by(ts=ts).first()
@@ -50,42 +50,22 @@ def upsert(ts, imp, exp, imp_price, exp_price):
     return row
 
 
-def _fetch_chunk(client, site_id, start, end, channel):
-    """Fetch ≤7-day chunk of data."""
-    url = f"sites/{site_id}/usage?channelType={channel}&startDate={start}&endDate={end}"
-    data = client._get(url)
-    if not isinstance(data, list):
-        print(f"[Amber] Invalid response for {channel} {start}→{end}: {data}")
-        return []
-    return data
-
-
-def _update_aggregates():
-    """Rebuild daily aggregates after each pull."""
-    db.session.query(Agg).delete()
-    daily = defaultdict(lambda: dict(imp=0.0, exp=0.0, cost=0.0))
-    for i in Interval.query.all():
-        d = i.ts.date()
-        daily[d]["imp"] += i.import_kwh
-        daily[d]["exp"] += i.export_kwh
-        daily[d]["cost"] += i.cost
-    for d, v in daily.items():
-        db.session.add(Agg(date=d, import_kwh=v["imp"], export_kwh=v["exp"], cost=v["cost"]))
-    db.session.commit()
-    print(f"[Amber] Aggregated {len(daily)} days into Agg table.")
-
-
 def pull_once(user=None):
-    """Pull Amber usage for import/export, safe 7-day chunks."""
+    """
+    Pulls both 'general' and 'feedIn' usage channels from Amber.
+    Works with 7-day limit and aggregates them into Interval.
+    """
     try:
+        # Resolve user
         if user is None:
             user = UserConfig.query.first()
             if not user:
-                return {"status": "error", "error": "No user found"}
+                return {"status": "error", "error": "No user configured"}
 
         base_url = current_app.config.get("AMBER_BASE_URL", "https://api.amber.com.au/v1")
         client = AmberClient(base_url=base_url, api_key=user.api_key)
 
+        # Resolve site
         site_id = user.site_id
         if not site_id:
             sites = client.sites()
@@ -95,34 +75,39 @@ def pull_once(user=None):
                 site_id = sites[0].get("id") or sites[0].get("siteId")
                 user.site_id = site_id
                 db.session.commit()
-
         if not site_id:
             return {"status": "no-site"}
 
-        # Use explicit 7-day window for now
+        # Amber max 7-day range
         start_date = datetime(2025, 10, 17).date()
         end_date = datetime(2025, 10, 24).date()
-        print(f"[Amber] Pulling {site_id} {start_date}→{end_date}")
+
+        print(f"[Amber] Fetching usage {start_date} → {end_date}")
 
         combined = defaultdict(lambda: dict(imp=0.0, exp=0.0, imp_p=0.0, exp_p=0.0))
+        for channel in ["general", "feedIn"]:
+            url = f"sites/{site_id}/usage?channelType={channel}&startDate={start_date}&endDate={end_date}"
+            data = client._get(url)
+            if not isinstance(data, list):
+                print(f"[Amber] Invalid or empty {channel} response: {data}")
+                continue
 
-        for ch in ["general", "feedIn"]:
-            data = _fetch_chunk(client, site_id, start_date, end_date, ch)
-            print(f"[Amber] Got {len(data)} records for {ch}")
+            print(f"[Amber] Received {len(data)} records for {channel}")
+
             for d in data:
                 ts = _parse_ts(d.get("startTime") or d.get("nemTime") or d.get("date"))
                 if not ts:
                     continue
                 kwh = float(d.get("kwh", 0.0))
-                # Amber changed field naming a few times
                 per = d.get("spotPerKwh")
                 if per is None:
                     per = d.get("perKwh", 0.0)
                 per = float(per)
-                combined[ts]["imp" if ch == "general" else "exp"] += kwh
-                if ch == "general":
+                if channel == "general":
+                    combined[ts]["imp"] += kwh
                     combined[ts]["imp_p"] = per
                 else:
+                    combined[ts]["exp"] += kwh
                     combined[ts]["exp_p"] = per
 
         count = 0
@@ -130,12 +115,11 @@ def pull_once(user=None):
             upsert(ts, v["imp"], v["exp"], v["imp_p"], v["exp_p"])
             count += 1
         db.session.commit()
-        print(f"[Amber] Stored {count} intervals between {start_date}→{end_date}")
 
-        _update_aggregates()
+        print(f"[Amber] Stored {count} intervals.")
         return {"status": "ok", "count": count}
 
     except Exception as e:
         db.session.rollback()
-        print(f"[Amber] pull failed: {e}")
+        print(f"[Amber] pull_once() failed: {e}")
         return {"status": "error", "error": str(e)}
