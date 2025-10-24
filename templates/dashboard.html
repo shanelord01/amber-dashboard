@@ -1,39 +1,112 @@
-{% extends 'base.html' %}
+{% extends "base.html" %}
 {% block content %}
-<h2>Usage & Cost</h2>
+<h1>Amber Dashboard</h1>
 
-<div class="chart-block">
-  <h3>Monthly Cost</h3>
-  <canvas id="chartMonthly"></canvas>
+<div class="summary">
+  <p>Site ID: {{ user.site_id or "Not set" }}</p>
+  <p>API Key: {% if user.api_key %}✅ Configured{% else %}❌ Missing{% endif %}</p>
 </div>
 
-<div class="chart-block">
-  <h3>Daily Cost (recent)</h3>
-  <canvas id="chartDaily"></canvas>
-</div>
+<hr>
 
-<script>
+<h2>Daily Summary (Recent Days)</h2>
+{% if daily %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Date</th>
+      <th>Import (kWh)</th>
+      <th>Export (kWh)</th>
+      <th>Net Cost ($)</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for d in daily %}
+    <tr>
+      <td>{{ d.day }}</td>
+      <td>{{ "%.2f"|format(d.import_kwh or 0) }}</td>
+      <td>{{ "%.2f"|format(d.export_kwh or 0) }}</td>
+      <td>
+        {% if (d.net_cost or 0) < 0 %}
+          <span style="color:green;">{{ "%.2f"|format(d.net_cost or 0) }}</span>
+        {% else %}
+          <span style="color:red;">{{ "%.2f"|format(d.net_cost or 0) }}</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No daily data available.</p>
+{% endif %}
 
-function sortedKeys(obj) {
-  return Object.keys(obj).sort();
-}
+<hr>
 
-function drawChart(id, labels, values, label) {
-  const ctx = document.getElementById(id);
-  new Chart(ctx, {
-    type: 'bar',
-    data: { labels, datasets: [{ label, data: values }] },
-    options: { responsive: true, maintainAspectRatio: false }
-  });
-}
+<h2>Monthly Summary</h2>
+{% if monthly %}
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Month</th>
+      <th>Import (kWh)</th>
+      <th>Export (kWh)</th>
+      <th>Net Cost ($)</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for m in monthly %}
+    <tr>
+      <td>{{ m.month }}</td>
+      <td>{{ "%.2f"|format(m.import_kwh or 0) }}</td>
+      <td>{{ "%.2f"|format(m.export_kwh or 0) }}</td>
+      <td>
+        {% if (m.net_cost or 0) < 0 %}
+          <span style="color:green;">{{ "%.2f"|format(m.net_cost or 0) }}</span>
+        {% else %}
+          <span style="color:red;">{{ "%.2f"|format(m.net_cost or 0) }}</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No monthly data available.</p>
+{% endif %}
 
-const mKeys = sortedKeys(agg.monthly || {});
-const mVals = mKeys.map(k => (agg.monthly[k]||0).toFixed(2));
-drawChart('chartMonthly', mKeys, mVals, 'Monthly Cost ($)');
+<hr>
 
-const dKeys = sortedKeys(agg.daily || {}).slice(-30);
-const dVals = dKeys.map(k => (agg.daily[k]||0).toFixed(2));
-drawChart('chartDaily', dKeys, dVals, 'Daily Cost ($)');
-</script>
+<h2>Recent Intervals (last 24h)</h2>
+{% if intervals %}
+<table class="data-table small">
+  <thead>
+    <tr>
+      <th>Timestamp</th>
+      <th>Import (kWh)</th>
+      <th>Export (kWh)</th>
+      <th>Cost ($)</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for i in intervals %}
+    <tr>
+      <td>{{ i.ts.strftime("%Y-%m-%d %H:%M") }}</td>
+      <td>{{ "%.3f"|format(i.import_kwh or 0) }}</td>
+      <td>{{ "%.3f"|format(i.export_kwh or 0) }}</td>
+      <td>
+        {% if (i.cost or 0) < 0 %}
+          <span style="color:green;">{{ "%.3f"|format(i.cost or 0) }}</span>
+        {% else %}
+          <span style="color:red;">{{ "%.3f"|format(i.cost or 0) }}</span>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No interval data available.</p>
+{% endif %}
+
 {% endblock %}
-
