@@ -1,0 +1,39 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Usage & Cost</h2>
+
+<div class="chart-block">
+  <h3>Monthly Cost</h3>
+  <canvas id="chartMonthly"></canvas>
+</div>
+
+<div class="chart-block">
+  <h3>Daily Cost (recent)</h3>
+  <canvas id="chartDaily"></canvas>
+</div>
+
+<script>
+const agg = {{ agg|tojson }};
+
+function sortedKeys(obj) {
+  return Object.keys(obj).sort();
+}
+
+function drawChart(id, labels, values, label) {
+  const ctx = document.getElementById(id);
+  new Chart(ctx, {
+    type: 'bar',
+    data: { labels, datasets: [{ label, data: values }] },
+    options: { responsive: true, maintainAspectRatio: false }
+  });
+}
+
+const mKeys = sortedKeys(agg.monthly || {});
+const mVals = mKeys.map(k => (agg.monthly[k]||0).toFixed(2));
+drawChart('chartMonthly', mKeys, mVals, 'Monthly Cost ($)');
+
+const dKeys = sortedKeys(agg.daily || {}).slice(-30);
+const dVals = dKeys.map(k => (agg.daily[k]||0).toFixed(2));
+drawChart('chartDaily', dKeys, dVals, 'Daily Cost ($)');
+</script>
+{% endblock %}
