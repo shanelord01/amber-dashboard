@@ -3,11 +3,12 @@ from flask import current_app
 import pytz
 from amber import AmberClient
 from models import db, Interval, UserConfig
+from collections import defaultdict
 
 AEST = pytz.timezone("Australia/Sydney")
 
-
 def _parse_ts(val):
+    """Parse Amber timestamp to AEST datetime."""
     if not val:
         return None
     try:
@@ -20,7 +21,6 @@ def _parse_ts(val):
         return val.astimezone(AEST)
     except Exception:
         return None
-
 
 def upsert(ts, imp, exp, imp_price, exp_price):
     """Store or update a 30-minute interval."""
@@ -47,15 +47,12 @@ def upsert(ts, imp, exp, imp_price, exp_price):
         row.cost = cost
     return row
 
-
 def pull_once(user=None):
     """
     Pull Amber usage for both import (general) and feedIn (export),
-    then compute costs exactly as Amber does.
-    Works with or without user explicitly passed.
+    normalize timestamps to AEST, and compute daily cost.
     """
     try:
-        # ✅ Fallback: query first user if not passed
         if user is None:
             user = UserConfig.query.first()
             if not user:
@@ -79,7 +76,8 @@ def pull_once(user=None):
         end_date = datetime.utcnow().date()
         start_date = end_date - timedelta(days=10)
 
-        # ✅ Pull import (general usage) and export (feedIn)
+        print(f"[Amber] Fetching data for site {site_id} ({start_date}→{end_date})")
+
         imp_data = client._get(
             f"sites/{site_id}/usage?channelType=general&startDate={start_date}&endDate={end_date}"
         )
@@ -87,27 +85,23 @@ def pull_once(user=None):
             f"sites/{site_id}/usage?channelType=feedIn&startDate={start_date}&endDate={end_date}"
         )
 
-        combined = {}
+        combined = defaultdict(lambda: dict(imp=0.0, exp=0.0, imp_p=0.0, exp_p=0.0))
 
-        # --- IMPORT ---
         for d in imp_data or []:
             ts = _parse_ts(d.get("startTime"))
             if not ts:
                 continue
             kwh = float(d.get("kwh", 0.0))
-            per = float(d.get("spotPerKwh", 0.0))  # cents/kWh
-            combined.setdefault(ts, dict(imp=0.0, exp=0.0, imp_p=0.0, exp_p=0.0))
+            per = float(d.get("spotPerKwh", 0.0))
             combined[ts]["imp"] += kwh
             combined[ts]["imp_p"] = per
 
-        # --- EXPORT ---
         for d in exp_data or []:
             ts = _parse_ts(d.get("startTime"))
             if not ts:
                 continue
             kwh = float(d.get("kwh", 0.0))
-            per = float(d.get("spotPerKwh", 0.0))  # negative for feed-in
-            combined.setdefault(ts, dict(imp=0.0, exp=0.0, imp_p=0.0, exp_p=0.0))
+            per = float(d.get("spotPerKwh", 0.0))
             combined[ts]["exp"] += kwh
             combined[ts]["exp_p"] = per
 
@@ -117,7 +111,22 @@ def pull_once(user=None):
             count += 1
 
         db.session.commit()
-        print(f"[Amber] Stored {count} intervals ({start_date}→{end_date})")
+        print(f"[Amber] Stored {count} half-hour intervals ({start_date}→{end_date})")
+
+        # Aggregate daily totals for debug
+        daily = defaultdict(lambda: dict(imp=0.0, exp=0.0, cost=0.0))
+        for ts, v in combined.items():
+            d = ts.date()
+            daily[d]["imp"] += v["imp"]
+            daily[d]["exp"] += v["exp"]
+            daily[d]["cost"] += (v["imp"] * v["imp_p"] / 100.0) + (v["exp"] * v["exp_p"] / 100.0)
+
+        print("=== Daily Totals ===")
+        for d, vals in sorted(daily.items()):
+            print(
+                f"{d}: Import {vals['imp']:.2f} kWh, Export {vals['exp']:.2f} kWh, Net ${vals['cost']:.2f}"
+            )
+
         return {"status": "ok", "count": count}
 
     except Exception as e:
