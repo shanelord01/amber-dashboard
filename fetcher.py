@@ -1,143 +1,138 @@
 import requests
 from datetime import datetime, timedelta
 from models import db, Interval
+import json
 
-API_BASE = "https://api.amber.com.au/v1"
-
-def get_headers(api_key):
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-        "User-Agent": "Amber-Dashboard/1.0"
-    }
-
-def get_site_id(api_key):
-    """Discover Amber site_id automatically by checking which one has real usage data."""
-    url = f"{API_BASE}/sites"
-    try:
-        r = requests.get(url, headers=get_headers(api_key))
-        r.raise_for_status()
-        sites = r.json()
-    except Exception as e:
-        print(f"[Amber] Failed to retrieve sites: {e}")
-        return None
-
-    if not sites or not isinstance(sites, list):
-        print("[Amber] No sites returned from API")
-        return None
-
-    for site in sites:
-        site_id = site.get("id")
-        if not site_id:
-            continue
-        test_start = (datetime.utcnow().date() - timedelta(days=7)).isoformat()
-        test_end = datetime.utcnow().date().isoformat()
-        usage_url = f"{API_BASE}/sites/{site_id}/usage?channelType=general&startDate={test_start}&endDate={test_end}"
-        try:
-            resp = requests.get(usage_url, headers=get_headers(api_key))
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    print(f"[Amber] Found active site ID: {site_id}")
-                    return site_id
-        except Exception as e:
-            print(f"[Amber] Site {site_id} check failed: {e}")
-    print("[Amber] No active sites returned usage data; using first site as fallback.")
-    return sites[0].get("id")
 
 def fetch_usage(api_key, site_id, channel_type, start_date, end_date):
-    """Fetch usage data for one channel and date range."""
-    url = f"{API_BASE}/sites/{site_id}/usage?channelType={channel_type}&startDate={start_date}&endDate={end_date}"
+    """Fetch usage data from Amber API for a date range and channel type."""
+    url = f"https://api.amber.com.au/v1/sites/{site_id}/usage"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    params = {
+        "channelType": channel_type,
+        "startDate": start_date.strftime("%Y-%m-%d"),
+        "endDate": end_date.strftime("%Y-%m-%d"),
+    }
+
+    resp = requests.get(url, headers=headers, params=params)
+    if resp.status_code != 200:
+        print(f"[Amber] Error fetching {channel_type}: {resp.status_code} {resp.text}")
+        return []
+
     try:
-        r = requests.get(url, headers=get_headers(api_key))
-        if r.status_code != 200:
-            print(f"[Amber] {channel_type} fetch failed {r.status_code}: {r.text}")
-            return []
-        data = r.json()
-        if isinstance(data, list):
-            print(f"[Amber] {channel_type} returned {len(data)} records for {start_date} → {end_date}")
-            return data
-        return []
+        data = resp.json()
     except Exception as e:
-        print(f"[Amber] Error fetching {channel_type}: {e}")
+        print(f"[Amber] JSON decode error: {e}")
         return []
 
-def _get_value(d, *keys):
-    """Return first matching numeric key."""
-    for k in keys:
-        if k in d and d[k] is not None:
-            try:
-                return float(d[k])
-            except Exception:
-                pass
-    return 0.0
+    # Amber returns a list of dicts; return directly
+    return data if isinstance(data, list) else []
 
-def pull_once(user, days_back=30):
-    """Pull and store interval data for one user in rolling 7-day batches."""
-    if not user.api_key:
-        return {"status": "error", "error": "Missing API key"}
 
-    site_id = user.site_id or get_site_id(user.api_key)
-    if not site_id:
+def auto_discover_site_id(api_key):
+    """Fetch user's site ID from Amber API."""
+    url = "https://api.amber.com.au/v1/sites"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    resp = requests.get(url, headers=headers)
+    if resp.status_code != 200:
+        print(f"[Amber] Error discovering site: {resp.status_code} {resp.text}")
+        return None
+    sites = resp.json()
+    if isinstance(sites, list) and len(sites) > 0:
+        print(f"[Amber] Found active site ID: {sites[0].get('id')}")
+        return sites[0].get("id")
+    print("[Amber] No active sites found.")
+    return None
+
+
+def pull_once(user):
+    """Pull and store usage data in batches of up to 7 days."""
+    api_key = user.api_key
+    site_id = user.site_id or auto_discover_site_id(api_key)
+
+    if not api_key or not site_id:
         return {"status": "error", "error": "Missing site_id or API key"}
 
+    user.site_id = site_id
+    db.session.commit()
     print(f"[Amber] Using site ID: {site_id}")
 
     end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=days_back)
+    start_date = end_date - timedelta(days=30)  # 1 month of history
+    batch = timedelta(days=7)
+
+    all_general, all_feed = [], []
+
     print(f"[Amber] Fetching usage {start_date} → {end_date} in 7-day batches")
 
-    all_general, all_feed_in = [], []
-    cursor = end_date
-    while cursor > start_date:
-        batch_end = cursor
-        batch_start = max(start_date, batch_end - timedelta(days=7))
-        cursor = batch_start
-        all_general.extend(fetch_usage(user.api_key, site_id, "general", batch_start, batch_end))
-        all_feed_in.extend(fetch_usage(user.api_key, site_id, "feedIn", batch_start, batch_end))
+    d1 = start_date
+    while d1 < end_date:
+        d2 = min(d1 + batch, end_date)
+        for ch_type, storage in [("general", all_general), ("feedIn", all_feed)]:
+            chunk = fetch_usage(api_key, site_id, ch_type, d1, d2)
+            print(f"[Amber] {ch_type} returned {len(chunk)} records for {d1} → {d2}")
+            storage.extend(chunk)
+        d1 += batch
 
-    print(f"[Amber] Total fetched: {len(all_general)} general, {len(all_feed_in)} feedIn")
+    print(
+        f"[Amber] Total fetched: {len(all_general)} general, {len(all_feed)} feedIn"
+    )
 
-    feed_in_map = {f.get("date") or f.get("startInterval"): f for f in all_feed_in if ("date" in f or "startInterval" in f)}
-    count = 0
+    stored = 0
+    db.session.rollback()  # reset in case of previous errors
 
-    for g in all_general:
+    for gen_rec, feed_rec in zip(all_general, all_feed):
         try:
-            date_str = g.get("date") or g.get("startInterval")
-            if not date_str:
+            ts_raw = gen_rec.get("interval") or gen_rec.get("timestamp")
+            if not ts_raw:
                 continue
-            ts = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
 
-            import_kwh = _get_value(g, "usageKwh", "quantity", "kwh", "energy")
-            import_cost = _get_value(g, "usageCost", "value", "cost", "costValue")
+            # Extract nested values safely
+            gen_channels = gen_rec.get("channels", [])
+            feed_channels = feed_rec.get("channels", [])
 
-            f = feed_in_map.get(date_str, {})
-            export_kwh = _get_value(f, "usageKwh", "quantity", "kwh", "energy")
-            export_cost = _get_value(f, "usageCost", "value", "cost", "costValue")
+            import_kwh = (
+                gen_channels[0].get("kwh") if gen_channels and gen_channels[0] else 0.0
+            )
+            export_kwh = (
+                feed_channels[0].get("kwh") if feed_channels and feed_channels[0] else 0.0
+            )
+            import_price = (
+                gen_channels[0].get("price")
+                if gen_channels and gen_channels[0]
+                else 0.0
+            )
+            export_price = (
+                feed_channels[0].get("price")
+                if feed_channels and feed_channels[0]
+                else 0.0
+            )
 
-            existing = Interval.query.filter_by(ts=ts).first()
-            if existing:
-                existing.import_kwh = import_kwh
-                existing.export_kwh = export_kwh
-                existing.cost = import_cost - export_cost
-            else:
-                db.session.add(Interval(
+            cost = (import_kwh * import_price) - (export_kwh * export_price)
+
+            interval = Interval.query.get(ts)
+            if not interval:
+                interval = Interval(
                     ts=ts,
                     import_kwh=import_kwh,
                     export_kwh=export_kwh,
-                    cost=import_cost - export_cost
-                ))
-            count += 1
+                    import_price=import_price,
+                    export_price=export_price,
+                    cost=cost,
+                )
+                db.session.add(interval)
+                stored += 1
+            else:
+                # update existing
+                interval.import_kwh = import_kwh
+                interval.export_kwh = export_kwh
+                interval.import_price = import_price
+                interval.export_price = export_price
+                interval.cost = cost
         except Exception as e:
             print(f"[Amber] Error processing record: {e}")
-            db.session.rollback()
 
-    try:
-        db.session.commit()
-    except Exception as e:
-        print(f"[Amber] Database commit failed: {e}")
-        db.session.rollback()
-        return {"status": "error", "error": str(e)}
-
-    print(f"[Amber] Stored {count} intervals.")
-    return {"status": "ok", "count": count}
+    db.session.commit()
+    print(f"[Amber] Stored {stored} intervals.")
+    return {"status": "ok", "count": stored}
