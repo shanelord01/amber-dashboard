@@ -46,29 +46,51 @@ def pull_once(user):
         return {"status": "error", "error": r.text}
 
     data = r.json()
-    general = data.get("general", [])
-    feed_in = data.get("feedIn", [])
+
+    # DEBUG: show sample
+    print("[Amber] Sample record from API:")
+    print(json.dumps(data[:3] if isinstance(data, list) else data, indent=2)[:1500])
+
+    # Handle new (list) or old (dict) formats
+    general, feed_in = [], []
+
+    if isinstance(data, list):
+        # New format: list of channels
+        for ch in data:
+            ctype = ch.get("channelType", "").lower()
+            if "general" in ctype or "consumption" in ctype:
+                general.extend(ch.get("usage", []))
+            elif "feedin" in ctype or "export" in ctype:
+                feed_in.extend(ch.get("usage", []))
+    elif isinstance(data, dict):
+        general = data.get("general", [])
+        feed_in = data.get("feedIn", [])
+    else:
+        print("[Amber] Unexpected API structure.")
+        return {"status": "error", "error": "Unexpected API response type"}
 
     print(f"[Amber] Received {len(general)} records for general")
     print(f"[Amber] Received {len(feed_in)} records for feedIn")
 
+    # Map feed-in by timestamp
     feed_in_map = {f["date"]: f for f in feed_in if "date" in f}
 
     count = 0
     for g in general:
         try:
             ts = datetime.fromisoformat(g["date"].replace("Z", "+00:00"))
-            import_kwh = float(g.get("kwh", 0))
-            import_cost = float(g.get("cost", 0))
-            feed = feed_in_map.get(g["date"], {})
-            export_kwh = float(feed.get("kwh", 0))
-            export_cost = float(feed.get("cost", 0))
+            import_kwh = float(g.get("kwh") or g.get("usageKwh") or 0)
+            import_cost = float(g.get("cost") or g.get("costValue") or 0)
+
+            f = feed_in_map.get(g["date"], {})
+            export_kwh = float(f.get("kwh") or f.get("usageKwh") or 0)
+            export_cost = float(f.get("cost") or f.get("costValue") or 0)
 
             interval = Interval(
                 ts=ts,
                 import_kwh=import_kwh,
                 export_kwh=export_kwh,
-                cost=import_cost - export_cost,  # net
+                cost=import_cost - export_cost
             )
             db.session.merge(interval)
             count += 1
