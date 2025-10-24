@@ -1,0 +1,29 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>What‑if simulation</h2>
+<form method="post" class="form">
+  <div class="grid">
+    <div>
+      <label>Solar size (kW)</label>
+      <input type="number" step="0.1" name="solar_kw" value="{{ params.solar_kw }}" />
+    </div>
+    <div>
+      <label>Battery size (kWh)</label>
+      <input type="number" step="0.1" name="battery_kwh" value="{{ params.battery_kwh }}" />
+    </div>
+    <div>
+      <label>Battery efficiency</label>
+      <input type="number" step="0.01" name="battery_efficiency" value="{{ params.battery_efficiency }}" />
+    </div>
+  </div>
+  <button type="submit">Run</button>
+</form>
+
+{% if result %}
+<div class="summary">
+  <p><strong>Baseline total:</strong> ${{ '%.2f'|format(result.baseline_total) }}</p>
+  <p><strong>Scenario total:</strong> ${{ '%.2f'|format(result.scenario_total) }}</p>
+  <p><strong>Savings (Δ):</strong> ${{ '%.2f'|format(result.delta) }}</p>
+</div>
+{% endif %}
+{% endblock %}
