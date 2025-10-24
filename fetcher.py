@@ -1,123 +1,81 @@
 import requests
-import datetime
-from decimal import Decimal
-from models import db, Interval, UserConfig
+from datetime import datetime, timedelta
+from models import db, Interval
+import json
+
+API_BASE = "https://api.amber.com.au/v1"
+
+def get_headers(api_key):
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/json",
+        "User-Agent": "Amber-Dashboard/1.0"
+    }
+
+def get_site_id(api_key):
+    """Discover Amber site_id automatically"""
+    url = f"{API_BASE}/sites"
+    r = requests.get(url, headers=get_headers(api_key))
+    r.raise_for_status()
+    sites = r.json()
+    if sites and isinstance(sites, list):
+        site_id = sites[0].get("id")
+        print(f"[Amber] Auto-discovered site ID: {site_id}")
+        return site_id
+    return None
 
 
-def pull_once(user=None):
-    """Fetch and store Amber usage/feedIn data for the past 7 days.
-    - Works even if app.py doesn't pass `user`
-    - Auto-discovers the correct Amber site_id if not stored
-    - Uses Amber's actual cost field for pricing accuracy
-    """
-    # backward compatibility: load default user
-    if user is None:
-        user = UserConfig.query.get(1)
+def pull_once(user):
+    """Pull and store interval data for one user"""
+    if not user.api_key:
+        return {"status": "error", "error": "Missing API key"}
 
-    if not user or not user.api_key:
-        return {"status": "error", "error": "Missing Amber API key"}
+    site_id = user.site_id or get_site_id(user.api_key)
+    if not site_id:
+        return {"status": "error", "error": "Missing site_id or API key"}
 
-    api_key = user.api_key.strip()
-    headers = {"Authorization": f"Bearer {api_key}"}
+    # Date range: last 7 days
+    end_date = datetime.utcnow().date()
+    start_date = end_date - timedelta(days=7)
+    url = f"{API_BASE}/sites/{site_id}/usage?startDate={start_date}&endDate={end_date}"
+    print(f"[Amber] Fetching usage {start_date} → {end_date}")
 
-    end = datetime.date.today()
-    start = end - datetime.timedelta(days=7)
-    start_str, end_str = start.isoformat(), end.isoformat()
+    r = requests.get(url, headers=get_headers(user.api_key))
+    if r.status_code != 200:
+        print(f"[Amber] Error {r.status_code}: {r.text}")
+        return {"status": "error", "error": r.text}
 
-    # 🔍 Auto-discover site ID if not set or invalid
-    if not user.site_id:
+    data = r.json()
+    general = data.get("general", [])
+    feed_in = data.get("feedIn", [])
+
+    print(f"[Amber] Received {len(general)} records for general")
+    print(f"[Amber] Received {len(feed_in)} records for feedIn")
+
+    feed_in_map = {f["date"]: f for f in feed_in if "date" in f}
+
+    count = 0
+    for g in general:
         try:
-            r = requests.get("https://api.amber.com.au/v1/sites", headers=headers, timeout=10)
-            if r.ok and isinstance(r.json(), list) and len(r.json()) > 0:
-                sites = r.json()
-                chosen = None
+            ts = datetime.fromisoformat(g["date"].replace("Z", "+00:00"))
+            import_kwh = float(g.get("kwh", 0))
+            import_cost = float(g.get("cost", 0))
+            feed = feed_in_map.get(g["date"], {})
+            export_kwh = float(feed.get("kwh", 0))
+            export_cost = float(feed.get("cost", 0))
 
-                # Try each site until one returns data
-                for s in sites:
-                    sid = s.get("id")
-                    utest = requests.get(
-                        f"https://api.amber.com.au/v1/sites/{sid}/usage?channelType=general&startDate={start_str}&endDate={end_str}",
-                        headers=headers, timeout=10,
-                    )
-                    if utest.ok and isinstance(utest.json(), list) and len(utest.json()) > 0:
-                        chosen = sid
-                        print(f"[Amber] Found active site ID: {sid}")
-                        break
+            interval = Interval(
+                ts=ts,
+                import_kwh=import_kwh,
+                export_kwh=export_kwh,
+                cost=import_cost - export_cost,  # net
+            )
+            db.session.merge(interval)
+            count += 1
 
-                if not chosen:
-                    chosen = sites[0]["id"]
-                    print(f"[Amber] Defaulted to first site ID: {chosen}")
-
-                user.site_id = chosen
-                db.session.commit()
-                print(f"[Amber] Auto-discovered site ID: {chosen}")
-            else:
-                print(f"[Amber] Failed to auto-discover site ID: {r.text}")
-                return {"status": "error", "error": "Unable to auto-discover site ID"}
-        except Exception as e:
-            print(f"[Amber] Error discovering site ID: {e}")
-            return {"status": "error", "error": f"Site ID lookup failed: {e}"}
-
-    site_id = user.site_id.strip()
-    print(f"[Amber] Fetching usage {start_str} → {end_str}")
-
-    def get_usage(channel_type):
-        url = (
-            f"https://api.amber.com.au/v1/sites/{site_id}/usage"
-            f"?channelType={channel_type}&startDate={start_str}&endDate={end_str}"
-        )
-        try:
-            r = requests.get(url, headers=headers, timeout=20)
-            if not r.ok:
-                print(f"[Amber] {channel_type} request failed: {r.text}")
-                return []
-            data = r.json()
-            if isinstance(data, list):
-                print(f"[Amber] Received {len(data)} records for {channel_type}")
-                return data
-            else:
-                print(f"[Amber] Unexpected response type for {channel_type}: {data}")
-                return []
-        except Exception as e:
-            print(f"[Amber] Error fetching {channel_type}: {e}")
-            return []
-
-    general_data = get_usage("general")
-    feedin_data = get_usage("feedIn")
-
-    if not general_data and not feedin_data:
-        print("[Amber] No records returned for either channel.")
-        return {"status": "ok", "count": 0}
-
-    all_records = general_data + feedin_data
-    print(f"[Amber] Processing {len(all_records)} total records")
-
-    added = 0
-    for rec in all_records:
-        try:
-            ts = datetime.datetime.fromisoformat(rec["nemTime"].replace("Z", "+00:00"))
-            kwh = Decimal(str(rec.get("kwh", 0)))
-            cost = Decimal(str(rec.get("cost", 0))) / Decimal("100")  # cents→AUD
-            channel = rec.get("channelType", "general")
-
-            # Use 'ts' instead of 'timestamp' for backwards compatibility
-            existing = Interval.query.filter_by(ts=ts).first()
-            interval = existing or Interval(ts=ts)
-            if not existing:
-                db.session.add(interval)
-
-            if channel == "general":
-                interval.kwh_import = float(kwh)
-                interval.cost_import = float(cost)
-            elif channel == "feedIn":
-                interval.kwh_export = float(kwh)
-                interval.cost_export = float(cost)
-            added += 1
         except Exception as e:
             print(f"[Amber] Error processing record: {e}")
-            continue
 
     db.session.commit()
-    stored = added // 2
-    print(f"[Amber] Stored {stored} intervals.")
-    return {"status": "ok", "count": stored}
+    print(f"[Amber] Stored {count} intervals.")
+    return {"status": "ok", "count": count}
