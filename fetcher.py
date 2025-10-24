@@ -75,9 +75,18 @@ def pull_once(now: datetime | None = None):
 
     # --- Fetch usage -------------------------------------------------------
     try:
-        usage = client.usage(site_id)
-    except Exception as e:
-        return {"status": "usage-error", "error": str(e)}
+        end_time = datetime.utcnow().isoformat() + "Z"
+        start_time = (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z"
+        usage = client.usage(
+            site_id,
+            params={
+                "resolution": "30m",
+                "startTime": start_time,
+                "endTime": end_time,
+        },
+    )
+except Exception as e:
+    return {"status": "usage-error", "error": str(e)}
 
     intervals = usage.get("data") if isinstance(usage, dict) else usage
     if not intervals:
@@ -141,3 +150,4 @@ def _parse_ts(val):
         return val
     except Exception:
         return None
+
