@@ -4,8 +4,11 @@ from decimal import Decimal
 from models import db, Interval, UserConfig
 
 
-def pull_once(user):
-    """Fetch and store up to 7 days of Amber usage and feedIn data."""
+def pull_once(user=None):
+    """Fetch and store Amber usage/feedIn data for the past 7 days."""
+    # backward compatibility: auto-load user if not passed
+    if user is None:
+        user = UserConfig.query.get(1)
 
     if not user or not user.api_key or not user.site_id:
         return {"status": "error", "error": "Missing site_id or API key"}
@@ -14,14 +17,12 @@ def pull_once(user):
     site_id = user.site_id.strip()
     headers = {"Authorization": f"Bearer {api_key}"}
 
-    # Amber allows a max 7-day window per request
     end = datetime.date.today()
     start = end - datetime.timedelta(days=7)
     start_str, end_str = start.isoformat(), end.isoformat()
     print(f"[Amber] Fetching usage {start_str} → {end_str}")
 
     def get_usage(channel_type):
-        """Fetch usage for one channel type (general/feedIn) and return JSON list."""
         url = (
             f"https://api.amber.com.au/v1/sites/{site_id}/usage"
             f"?channelType={channel_type}&startDate={start_str}&endDate={end_str}"
@@ -56,10 +57,9 @@ def pull_once(user):
         try:
             ts = datetime.datetime.fromisoformat(rec["nemTime"].replace("Z", "+00:00"))
             kwh = Decimal(str(rec.get("kwh", 0)))
-            cost = Decimal(str(rec.get("cost", 0))) / Decimal("100")  # convert to AUD
+            cost = Decimal(str(rec.get("cost", 0))) / Decimal("100")  # AUD
             channel = rec.get("channelType", "general")
 
-            # Feed-in cost is already negative in Amber data
             existing = Interval.query.filter_by(timestamp=ts).first()
             if not existing:
                 interval = Interval(timestamp=ts)
@@ -80,6 +80,5 @@ def pull_once(user):
             continue
 
     db.session.commit()
-    print(f"[Amber] Stored {added // 2} intervals.")  # roughly half once merged
-
+    print(f"[Amber] Stored {added // 2} intervals.")
     return {"status": "ok", "count": added // 2}
