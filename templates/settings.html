@@ -1,0 +1,31 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Settings</h2>
+<form method="post" class="form">
+  <label>Amber API Key</label>
+  <input type="password" name="api_key" value="{{ user.api_key or '' }}" placeholder="Paste your Amber API key" />
+
+  <label>Site ID (optional – will auto-discover)</label>
+  <input type="text" name="site_id" value="{{ user.site_id or '' }}" placeholder="e.g. 01J2..." />
+
+  <fieldset>
+    <legend>What‑if Defaults</legend>
+    <div class="grid">
+      <div>
+        <label>Solar size (kW)</label>
+        <input type="number" step="0.1" name="solar_kw" value="{{ user.solar_kw or 0 }}" />
+      </div>
+      <div>
+        <label>Battery size (kWh)</label>
+        <input type="number" step="0.1" name="battery_kwh" value="{{ user.battery_kwh or 0 }}" />
+      </div>
+      <div>
+        <label>Battery round‑trip efficiency</label>
+        <input type="number" step="0.01" name="battery_efficiency" value="{{ user.battery_efficiency or 0.9 }}" />
+      </div>
+    </div>
+  </fieldset>
+
+  <button type="submit">Save</button>
+</form>
+{% endblock %}
