@@ -5,12 +5,11 @@ from flask import current_app
 from models import db, UserConfig, Interval
 from amber import AmberClient
 
-# Set timezone
 AEST = pytz.timezone("Australia/Sydney")
 
 
 def upsert_interval(ts: datetime, import_kwh: float, export_kwh: float, import_price: float, export_price: float):
-    """Insert or update a usage interval in the database."""
+    """Insert or update an interval record in the DB."""
     row = Interval.query.filter_by(ts=ts).first()
     cost = (import_kwh * import_price) - (export_kwh * export_price)
     if not row:
@@ -33,16 +32,12 @@ def upsert_interval(ts: datetime, import_kwh: float, export_kwh: float, import_p
 
 
 def pull_once(now: datetime | None = None):
-    """Pull last ~30 days of usage & prices and upsert into DB.
-
-    Works both when called from Flask request handlers (with app context)
-    and from background scheduler jobs (without app context).
-    """
+    """Pull ~30 days of usage & prices and upsert into DB."""
     user = UserConfig.query.get(1)
     if not user or not user.api_key:
         return {"status": "no-api-key"}
 
-    # Try Flask config first, fallback to environment variable
+    # Try Flask config first, fallback to env var
     try:
         base_url = current_app.config.get("AMBER_BASE_URL")
     except Exception:
@@ -79,18 +74,14 @@ def pull_once(now: datetime | None = None):
         start_time = (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z"
         usage = client.usage(
             site_id,
-            params={
-                "resolution": "30m",
-                "startTime": start_time,
-                "endTime": end_time,
-        },
-    )
-except Exception as e:
-    return {"status": "usage-error", "error": str(e)}
+            resolution="30m",
+            startTime=start_time,
+            endTime=end_time,
+        )
+    except Exception as e:
+        return {"status": "usage-error", "error": str(e)}
 
-    intervals = usage.get("data") if isinstance(usage, dict) else usage
-    if not intervals:
-        intervals = []
+    intervals = usage.get("data") if isinstance(usage, dict) else usage or []
 
     # --- Fetch prices ------------------------------------------------------
     try:
@@ -112,7 +103,7 @@ except Exception as e:
                 "export": p.get("export", 0.0),
             }
 
-    # --- Merge into DB -----------------------------------------------------
+    # --- Merge usage & prices ---------------------------------------------
     count = 0
     for it in intervals:
         ts = _parse_ts(it.get("interval_start") or it.get("start"))
@@ -125,13 +116,7 @@ except Exception as e:
         import_price = float(price.get("import", 0.0))
         export_price = float(price.get("export", 0.0))
 
-        upsert_interval(
-            ts,
-            float(import_kwh or 0.0),
-            float(export_kwh or 0.0),
-            import_price,
-            export_price,
-        )
+        upsert_interval(ts, float(import_kwh or 0.0), float(export_kwh or 0.0), import_price, export_price)
         count += 1
 
     db.session.commit()
@@ -139,7 +124,7 @@ except Exception as e:
 
 
 def _parse_ts(val):
-    """Parse Amber ISO8601 timestamp into datetime."""
+    """Parse ISO8601 timestamp into datetime."""
     if not val:
         return None
     try:
@@ -150,4 +135,3 @@ def _parse_ts(val):
         return val
     except Exception:
         return None
-
