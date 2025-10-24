@@ -20,7 +20,8 @@ def _parse_ts(val):
                 dt = datetime.fromisoformat(val)
             return dt.astimezone(AEST)
         return val.astimezone(AEST)
-    except Exception:
+    except Exception as e:
+        print(f"[Amber] Timestamp parse failed for {val}: {e}")
         return None
 
 
@@ -50,18 +51,17 @@ def upsert(ts, imp, exp, imp_price, exp_price):
 
 
 def _fetch_chunk(client, site_id, start, end, channel):
-    """Fetch one ≤7-day chunk of data."""
+    """Fetch ≤7-day chunk of data."""
     url = f"sites/{site_id}/usage?channelType={channel}&startDate={start}&endDate={end}"
     data = client._get(url)
-    if isinstance(data, dict) and "error" in data:
-        print(f"[Amber] Error fetching {channel} {start}→{end}: {data['error']}")
+    if not isinstance(data, list):
+        print(f"[Amber] Invalid response for {channel} {start}→{end}: {data}")
         return []
-    return data or []
+    return data
 
 
 def _update_aggregates():
-    """Aggregate all Interval data into Agg (daily totals)."""
-    print("[Amber] Updating aggregate daily totals…")
+    """Rebuild daily aggregates after each pull."""
     db.session.query(Agg).delete()
     daily = defaultdict(lambda: dict(imp=0.0, exp=0.0, cost=0.0))
     for i in Interval.query.all():
@@ -69,26 +69,23 @@ def _update_aggregates():
         daily[d]["imp"] += i.import_kwh
         daily[d]["exp"] += i.export_kwh
         daily[d]["cost"] += i.cost
-    for d, vals in sorted(daily.items()):
-        agg = Agg(date=d, import_kwh=vals["imp"], export_kwh=vals["exp"], cost=vals["cost"])
-        db.session.add(agg)
+    for d, v in daily.items():
+        db.session.add(Agg(date=d, import_kwh=v["imp"], export_kwh=v["exp"], cost=v["cost"]))
     db.session.commit()
     print(f"[Amber] Aggregated {len(daily)} days into Agg table.")
 
 
 def pull_once(user=None):
-    """
-    Pull Amber usage for import (general) and feedIn (export),
-    respecting Amber’s 7-day range limit, then update aggregates.
-    """
+    """Pull Amber usage for import/export, safe 7-day chunks."""
     try:
         if user is None:
             user = UserConfig.query.first()
             if not user:
-                return {"status": "error", "error": "No user found in DB"}
+                return {"status": "error", "error": "No user found"}
 
         base_url = current_app.config.get("AMBER_BASE_URL", "https://api.amber.com.au/v1")
         client = AmberClient(base_url=base_url, api_key=user.api_key)
+
         site_id = user.site_id
         if not site_id:
             sites = client.sites()
@@ -102,42 +99,40 @@ def pull_once(user=None):
         if not site_id:
             return {"status": "no-site"}
 
-        end_date = datetime.utcnow().date()
-        start_date = end_date - timedelta(days=14)  # pull 2 weeks, 7-day chunks
-        print(f"[Amber] Fetching site {site_id} from {start_date} to {end_date} (max 7-day chunks)")
+        # Use explicit 7-day window for now
+        start_date = datetime(2025, 10, 17).date()
+        end_date = datetime(2025, 10, 24).date()
+        print(f"[Amber] Pulling {site_id} {start_date}→{end_date}")
 
         combined = defaultdict(lambda: dict(imp=0.0, exp=0.0, imp_p=0.0, exp_p=0.0))
-        day = start_date
-        while day < end_date:
-            chunk_end = min(day + timedelta(days=7), end_date)
-            for ch in ["general", "feedIn"]:
-                data = _fetch_chunk(client, site_id, day, chunk_end, ch)
-                print(f"[Amber] Got {len(data)} {ch} records for {day}→{chunk_end}")
-                for d in data:
-                    ts = _parse_ts(d.get("startTime"))
-                    if not ts:
-                        continue
-                    kwh = float(d.get("kwh", 0.0))
-                    per = float(d.get("spotPerKwh", 0.0))
-                    if ch == "general":
-                        combined[ts]["imp"] += kwh
-                        combined[ts]["imp_p"] = per
-                    else:
-                        combined[ts]["exp"] += kwh
-                        combined[ts]["exp_p"] = per
-            day += timedelta(days=7)
+
+        for ch in ["general", "feedIn"]:
+            data = _fetch_chunk(client, site_id, start_date, end_date, ch)
+            print(f"[Amber] Got {len(data)} records for {ch}")
+            for d in data:
+                ts = _parse_ts(d.get("startTime") or d.get("nemTime") or d.get("date"))
+                if not ts:
+                    continue
+                kwh = float(d.get("kwh", 0.0))
+                # Amber changed field naming a few times
+                per = d.get("spotPerKwh")
+                if per is None:
+                    per = d.get("perKwh", 0.0)
+                per = float(per)
+                combined[ts]["imp" if ch == "general" else "exp"] += kwh
+                if ch == "general":
+                    combined[ts]["imp_p"] = per
+                else:
+                    combined[ts]["exp_p"] = per
 
         count = 0
         for ts, v in combined.items():
             upsert(ts, v["imp"], v["exp"], v["imp_p"], v["exp_p"])
             count += 1
-
         db.session.commit()
-        print(f"[Amber] Stored {count} half-hour intervals ({start_date}→{end_date})")
+        print(f"[Amber] Stored {count} intervals between {start_date}→{end_date}")
 
         _update_aggregates()
-
-        print("[Amber] Pull complete.")
         return {"status": "ok", "count": count}
 
     except Exception as e:
