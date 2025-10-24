@@ -6,9 +6,11 @@ from models import db, Interval, UserConfig
 
 def pull_once(user=None):
     """Fetch and store Amber usage/feedIn data for the past 7 days.
-    Auto-discovers site ID if not set and stays backward-compatible with old app.py.
+    - Works even if app.py doesn't pass `user`
+    - Auto-discovers the correct Amber site_id if not stored
+    - Uses Amber's actual cost field for pricing accuracy
     """
-    # backward compatibility: auto-load user if not passed
+    # backward compatibility: load default user
     if user is None:
         user = UserConfig.query.get(1)
 
@@ -18,15 +20,37 @@ def pull_once(user=None):
     api_key = user.api_key.strip()
     headers = {"Authorization": f"Bearer {api_key}"}
 
-    # 🔍 Auto-discover site ID if not set
+    end = datetime.date.today()
+    start = end - datetime.timedelta(days=7)
+    start_str, end_str = start.isoformat(), end.isoformat()
+
+    # 🔍 Auto-discover site ID if not set or invalid
     if not user.site_id:
         try:
             r = requests.get("https://api.amber.com.au/v1/sites", headers=headers, timeout=10)
             if r.ok and isinstance(r.json(), list) and len(r.json()) > 0:
-                site_id = r.json()[0]["id"]
-                user.site_id = site_id
+                sites = r.json()
+                chosen = None
+
+                # Try each site until one returns data
+                for s in sites:
+                    sid = s.get("id")
+                    utest = requests.get(
+                        f"https://api.amber.com.au/v1/sites/{sid}/usage?channelType=general&startDate={start_str}&endDate={end_str}",
+                        headers=headers, timeout=10,
+                    )
+                    if utest.ok and isinstance(utest.json(), list) and len(utest.json()) > 0:
+                        chosen = sid
+                        print(f"[Amber] Found active site ID: {sid}")
+                        break
+
+                if not chosen:
+                    chosen = sites[0]["id"]
+                    print(f"[Amber] Defaulted to first site ID: {chosen}")
+
+                user.site_id = chosen
                 db.session.commit()
-                print(f"[Amber] Auto-discovered site ID: {site_id}")
+                print(f"[Amber] Auto-discovered site ID: {chosen}")
             else:
                 print(f"[Amber] Failed to auto-discover site ID: {r.text}")
                 return {"status": "error", "error": "Unable to auto-discover site ID"}
@@ -35,9 +59,6 @@ def pull_once(user=None):
             return {"status": "error", "error": f"Site ID lookup failed: {e}"}
 
     site_id = user.site_id.strip()
-    end = datetime.date.today()
-    start = end - datetime.timedelta(days=7)
-    start_str, end_str = start.isoformat(), end.isoformat()
     print(f"[Amber] Fetching usage {start_str} → {end_str}")
 
     def get_usage(channel_type):
@@ -54,8 +75,9 @@ def pull_once(user=None):
             if isinstance(data, list):
                 print(f"[Amber] Received {len(data)} records for {channel_type}")
                 return data
-            print(f"[Amber] Unexpected response type for {channel_type}: {data}")
-            return []
+            else:
+                print(f"[Amber] Unexpected response type for {channel_type}: {data}")
+                return []
         except Exception as e:
             print(f"[Amber] Error fetching {channel_type}: {e}")
             return []
@@ -64,6 +86,7 @@ def pull_once(user=None):
     feedin_data = get_usage("feedIn")
 
     if not general_data and not feedin_data:
+        print("[Amber] No records returned for either channel.")
         return {"status": "ok", "count": 0}
 
     all_records = general_data + feedin_data
@@ -94,5 +117,6 @@ def pull_once(user=None):
             continue
 
     db.session.commit()
-    print(f"[Amber] Stored {added // 2} intervals.")
-    return {"status": "ok", "count": added // 2}
+    stored = added // 2
+    print(f"[Amber] Stored {stored} intervals.")
+    return {"status": "ok", "count": stored}
