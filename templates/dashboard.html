@@ -13,7 +13,6 @@
 </div>
 
 <script>
-const agg = {{ agg|tojson }};
 
 function sortedKeys(obj) {
   return Object.keys(obj).sort();
@@ -37,3 +36,4 @@ const dVals = dKeys.map(k => (agg.daily[k]||0).toFixed(2));
 drawChart('chartDaily', dKeys, dVals, 'Daily Cost ($)');
 </script>
 {% endblock %}
+
