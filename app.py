@@ -51,7 +51,7 @@ def index():
 
     user = UserConfig.query.get(1)
     return render_template(
-        "index.html",
+        "dashboard.html",
         intervals=intervals,
         daily=daily,
         monthly=monthly,
