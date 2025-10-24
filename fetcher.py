@@ -67,27 +67,35 @@ def pull_once(now: datetime | None = None):
     if now is None:
         now = datetime.now(AEST)
     start = (now - timedelta(days=30)).astimezone(AEST)
+    start_time = (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z"
+    end_time = datetime.utcnow().isoformat() + "Z"
 
     # --- Fetch usage -------------------------------------------------------
     try:
-        end_time = datetime.utcnow().isoformat() + "Z"
-        start_time = (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z"
-        usage = client.usage(
-            site_id,
-            resolution="30m",
-            startTime=start_time,
-            endTime=end_time,
-        )
+        # Amber expects ISO8601 duration ("PT30M") instead of "30m"
+        params = {
+            "resolution": "PT30M",
+            "startTime": start_time,
+            "endTime": end_time,
+        }
+        usage = client.usage(site_id, **params)
     except Exception as e:
-        return {"status": "usage-error", "error": str(e)}
+        # Retry with fallback endpoint
+        try:
+            usage = client._get(
+                f"sites/{site_id}/usage/day",
+                params={"startTime": start_time, "endTime": end_time},
+            )
+        except Exception as e2:
+            return {"status": "usage-error", "error": f"{str(e2)}"}
 
     intervals = usage.get("data") if isinstance(usage, dict) else usage or []
 
     # --- Fetch prices ------------------------------------------------------
     try:
         prices = client.prices(site_id)
-    except Exception:
-        prices = {}
+    except Exception as e:
+        return {"status": "prices-error", "error": str(e)}
 
     price_idx = {}
     if isinstance(prices, dict):
@@ -116,7 +124,13 @@ def pull_once(now: datetime | None = None):
         import_price = float(price.get("import", 0.0))
         export_price = float(price.get("export", 0.0))
 
-        upsert_interval(ts, float(import_kwh or 0.0), float(export_kwh or 0.0), import_price, export_price)
+        upsert_interval(
+            ts,
+            float(import_kwh or 0.0),
+            float(export_kwh or 0.0),
+            import_price,
+            export_price,
+        )
         count += 1
 
     db.session.commit()
