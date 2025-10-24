@@ -100,8 +100,9 @@ def pull_once(user=None):
             cost = Decimal(str(rec.get("cost", 0))) / Decimal("100")  # cents→AUD
             channel = rec.get("channelType", "general")
 
-            existing = Interval.query.filter_by(timestamp=ts).first()
-            interval = existing or Interval(timestamp=ts)
+            # Use 'ts' instead of 'timestamp' for backwards compatibility
+            existing = Interval.query.filter_by(ts=ts).first()
+            interval = existing or Interval(ts=ts)
             if not existing:
                 db.session.add(interval)
 
