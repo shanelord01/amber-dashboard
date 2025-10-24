@@ -7,6 +7,7 @@ from collections import defaultdict
 
 AEST = pytz.timezone("Australia/Sydney")
 
+
 def _parse_ts(val):
     """Parse Amber timestamp to AEST datetime."""
     if not val:
@@ -22,12 +23,12 @@ def _parse_ts(val):
     except Exception:
         return None
 
+
 def upsert(ts, imp, exp, imp_price, exp_price):
     """Store or update a 30-minute interval."""
     if not ts:
         return
     row = Interval.query.filter_by(ts=ts).first()
-    # Amber prices are in cents/kWh; convert to dollars.
     cost = (imp * imp_price / 100.0) + (exp * exp_price / 100.0)
     if not row:
         row = Interval(
@@ -47,10 +48,21 @@ def upsert(ts, imp, exp, imp_price, exp_price):
         row.cost = cost
     return row
 
+
+def _fetch_chunk(client, site_id, start, end, channel):
+    """Fetch one ≤7-day chunk of data."""
+    url = f"sites/{site_id}/usage?channelType={channel}&startDate={start}&endDate={end}"
+    data = client._get(url)
+    if isinstance(data, dict) and "error" in data:
+        print(f"[Amber] Error fetching {channel} {start}→{end}: {data['error']}")
+        return []
+    return data or []
+
+
 def pull_once(user=None):
     """
-    Pull Amber usage for both import (general) and feedIn (export),
-    normalize timestamps to AEST, and compute daily cost.
+    Pull Amber usage for import (general) and feedIn (export),
+    respecting Amber’s 7-day range limit.
     """
     try:
         if user is None:
@@ -74,36 +86,31 @@ def pull_once(user=None):
             return {"status": "no-site"}
 
         end_date = datetime.utcnow().date()
-        start_date = end_date - timedelta(days=10)
+        start_date = end_date - timedelta(days=14)  # 2 weeks total (split into 7-day chunks)
 
-        print(f"[Amber] Fetching data for site {site_id} ({start_date}→{end_date})")
-
-        imp_data = client._get(
-            f"sites/{site_id}/usage?channelType=general&startDate={start_date}&endDate={end_date}"
-        )
-        exp_data = client._get(
-            f"sites/{site_id}/usage?channelType=feedIn&startDate={start_date}&endDate={end_date}"
-        )
+        print(f"[Amber] Fetching site {site_id} from {start_date} to {end_date} (max 7-day chunks)")
 
         combined = defaultdict(lambda: dict(imp=0.0, exp=0.0, imp_p=0.0, exp_p=0.0))
+        day = start_date
 
-        for d in imp_data or []:
-            ts = _parse_ts(d.get("startTime"))
-            if not ts:
-                continue
-            kwh = float(d.get("kwh", 0.0))
-            per = float(d.get("spotPerKwh", 0.0))
-            combined[ts]["imp"] += kwh
-            combined[ts]["imp_p"] = per
-
-        for d in exp_data or []:
-            ts = _parse_ts(d.get("startTime"))
-            if not ts:
-                continue
-            kwh = float(d.get("kwh", 0.0))
-            per = float(d.get("spotPerKwh", 0.0))
-            combined[ts]["exp"] += kwh
-            combined[ts]["exp_p"] = per
+        while day < end_date:
+            chunk_end = min(day + timedelta(days=7), end_date)
+            for ch in ["general", "feedIn"]:
+                data = _fetch_chunk(client, site_id, day, chunk_end, ch)
+                print(f"[Amber] Got {len(data)} {ch} records for {day}→{chunk_end}")
+                for d in data:
+                    ts = _parse_ts(d.get("startTime"))
+                    if not ts:
+                        continue
+                    kwh = float(d.get("kwh", 0.0))
+                    per = float(d.get("spotPerKwh", 0.0))
+                    if ch == "general":
+                        combined[ts]["imp"] += kwh
+                        combined[ts]["imp_p"] = per
+                    else:
+                        combined[ts]["exp"] += kwh
+                        combined[ts]["exp_p"] = per
+            day += timedelta(days=7)
 
         count = 0
         for ts, v in combined.items():
@@ -113,7 +120,7 @@ def pull_once(user=None):
         db.session.commit()
         print(f"[Amber] Stored {count} half-hour intervals ({start_date}→{end_date})")
 
-        # Aggregate daily totals for debug
+        # Summarize daily totals
         daily = defaultdict(lambda: dict(imp=0.0, exp=0.0, cost=0.0))
         for ts, v in combined.items():
             d = ts.date()
@@ -123,9 +130,7 @@ def pull_once(user=None):
 
         print("=== Daily Totals ===")
         for d, vals in sorted(daily.items()):
-            print(
-                f"{d}: Import {vals['imp']:.2f} kWh, Export {vals['exp']:.2f} kWh, Net ${vals['cost']:.2f}"
-            )
+            print(f"{d}: Import {vals['imp']:.2f} kWh, Export {vals['exp']:.2f} kWh, Net ${vals['cost']:.2f}")
 
         return {"status": "ok", "count": count}
 
