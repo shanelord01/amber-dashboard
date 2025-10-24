@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
+import requests
 from flask import current_app
 import pytz
-from amber import AmberClient
 from models import db, Interval, UserConfig
 from collections import defaultdict
 
@@ -50,35 +50,39 @@ def upsert(ts, imp, exp, imp_price, exp_price):
     return row
 
 
-def pull_once(user=None):
-    """
-    Pulls both 'general' and 'feedIn' usage channels from Amber.
-    Works with 7-day limit and aggregates them into Interval.
-    """
+def _fetch_chunk(site_id, api_key, start, end, channel):
+    """Directly query Amber API for a channel."""
+    url = f"https://api.amber.com.au/v1/sites/{site_id}/usage"
+    params = {"channelType": channel, "startDate": start, "endDate": end}
+    headers = {"Authorization": f"Bearer {api_key}"}
     try:
-        # Resolve user
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        if r.status_code != 200:
+            print(f"[Amber] {channel} {r.status_code} error: {r.text[:120]}")
+            return []
+        data = r.json()
+        if not isinstance(data, list):
+            print(f"[Amber] Unexpected {channel} response type: {type(data)}")
+            return []
+        return data
+    except Exception as e:
+        print(f"[Amber] _fetch_chunk() failed for {channel}: {e}")
+        return []
+
+
+def pull_once(user=None):
+    """Pull Amber usage directly via requests."""
+    try:
         if user is None:
             user = UserConfig.query.first()
             if not user:
                 return {"status": "error", "error": "No user configured"}
 
-        base_url = current_app.config.get("AMBER_BASE_URL", "https://api.amber.com.au/v1")
-        client = AmberClient(base_url=base_url, api_key=user.api_key)
-
-        # Resolve site
         site_id = user.site_id
-        if not site_id:
-            sites = client.sites()
-            if isinstance(sites, dict) and "sites" in sites:
-                sites = sites["sites"]
-            if sites:
-                site_id = sites[0].get("id") or sites[0].get("siteId")
-                user.site_id = site_id
-                db.session.commit()
-        if not site_id:
-            return {"status": "no-site"}
+        api_key = user.api_key
+        if not (site_id and api_key):
+            return {"status": "error", "error": "Missing site_id or API key"}
 
-        # Amber max 7-day range
         start_date = datetime(2025, 10, 17).date()
         end_date = datetime(2025, 10, 24).date()
 
@@ -86,14 +90,8 @@ def pull_once(user=None):
 
         combined = defaultdict(lambda: dict(imp=0.0, exp=0.0, imp_p=0.0, exp_p=0.0))
         for channel in ["general", "feedIn"]:
-            url = f"sites/{site_id}/usage?channelType={channel}&startDate={start_date}&endDate={end_date}"
-            data = client._get(url)
-            if not isinstance(data, list):
-                print(f"[Amber] Invalid or empty {channel} response: {data}")
-                continue
-
+            data = _fetch_chunk(site_id, api_key, start_date, end_date, channel)
             print(f"[Amber] Received {len(data)} records for {channel}")
-
             for d in data:
                 ts = _parse_ts(d.get("startTime") or d.get("nemTime") or d.get("date"))
                 if not ts:
