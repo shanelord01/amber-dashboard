@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 import pytz
-import os
 from flask import current_app
 from models import db, UserConfig, Interval
 from amber import AmberClient
@@ -8,8 +7,22 @@ from amber import AmberClient
 AEST = pytz.timezone("Australia/Sydney")
 
 
-def upsert_interval(ts: datetime, import_kwh: float, export_kwh: float, import_price: float, export_price: float):
-    """Insert or update an interval record in the DB."""
+def _parse_ts(val):
+    """Parse Amber timestamp strings safely."""
+    if not val:
+        return None
+    try:
+        if isinstance(val, str):
+            if val.endswith("Z"):
+                return datetime.fromisoformat(val.replace("Z", "+00:00"))
+            return datetime.fromisoformat(val)
+        return val
+    except Exception:
+        return None
+
+
+def upsert_interval(ts, import_kwh, export_kwh, import_price, export_price):
+    """Insert or update an interval row in the DB."""
     row = Interval.query.filter_by(ts=ts).first()
     cost = (import_kwh * import_price) - (export_kwh * export_price)
     if not row:
@@ -32,120 +45,68 @@ def upsert_interval(ts: datetime, import_kwh: float, export_kwh: float, import_p
 
 
 def pull_once(now: datetime | None = None):
-    """Pull ~30 days of usage & prices and upsert into DB."""
+    """Pull ~30 days of usage data from Amber and store locally."""
     user = UserConfig.query.get(1)
     if not user or not user.api_key:
         return {"status": "no-api-key"}
 
-    # Try Flask config first, fallback to env var
-    try:
-        base_url = current_app.config.get("AMBER_BASE_URL")
-    except Exception:
-        base_url = os.getenv("AMBER_BASE_URL", "https://api.amber.com.au/v1")
-
+    base_url = current_app.config.get("AMBER_BASE_URL", "https://api.amber.com.au/v1")
     client = AmberClient(base_url=base_url, api_key=user.api_key)
 
-    # --- Site discovery ----------------------------------------------------
+    # --- Site discovery -------------------------------------------------------
     site_id = user.site_id
     if not site_id:
         try:
             sites = client.sites()
-            if isinstance(sites, dict) and "sites" in sites:
-                sites = sites["sites"]
-            if sites:
-                site_id = sites[0].get("id") or sites[0].get("siteId")
-                if site_id:
-                    user.site_id = site_id
-                    db.session.commit()
+            if isinstance(sites, list) and sites:
+                site_id = sites[0].get("id")
+                user.site_id = site_id
+                db.session.commit()
         except Exception as e:
             return {"status": "sites-error", "error": str(e)}
 
     if not site_id:
         return {"status": "no-site"}
 
-    # --- Time window -------------------------------------------------------
+    # --- Time window ----------------------------------------------------------
     if now is None:
         now = datetime.now(AEST)
-    start = (now - timedelta(days=30)).astimezone(AEST)
-    start_time = (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z"
-    end_time = datetime.utcnow().isoformat() + "Z"
+    start = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+    end = now.strftime("%Y-%m-%d")
 
-    # --- Fetch usage -------------------------------------------------------
+    # --- Fetch usage ----------------------------------------------------------
     try:
-        # Amber expects ISO8601 duration ("PT30M") instead of "30m"
-        params = {
-            "resolution": "PT30M",
-            "startTime": start_time,
-            "endTime": end_time,
-        }
-        usage = client.usage(site_id, **params)
-    except Exception as e:
-        # Retry with fallback endpoint
-        try:
-            usage = client._get(
-                f"sites/{site_id}/usage/day",
-                params={"startTime": start_time, "endTime": end_time},
-            )
-        except Exception as e2:
-            return {"status": "usage-error", "error": f"{str(e2)}"}
-
-    intervals = usage.get("data") if isinstance(usage, dict) else usage or []
-
-    # --- Fetch prices ------------------------------------------------------
-    try:
-        prices = client.prices(site_id)
-    except Exception as e:
-        return {"status": "prices-error", "error": str(e)}
-
-    price_idx = {}
-    if isinstance(prices, dict):
-        price_list = prices.get("data") or prices.get("prices") or []
-    else:
-        price_list = prices or []
-
-    for p in price_list:
-        ts = _parse_ts(p.get("start") or p.get("interval_start"))
-        if ts:
-            price_idx[ts] = {
-                "import": p.get("per_kwh", p.get("import", 0.0)),
-                "export": p.get("export", 0.0),
-            }
-
-    # --- Merge usage & prices ---------------------------------------------
-    count = 0
-    for it in intervals:
-        ts = _parse_ts(it.get("interval_start") or it.get("start"))
-        if not ts or ts < start:
-            continue
-
-        import_kwh = it.get("import_kwh") or it.get("kwh", 0.0)
-        export_kwh = it.get("export_kwh", 0.0)
-        price = price_idx.get(ts, {})
-        import_price = float(price.get("import", 0.0))
-        export_price = float(price.get("export", 0.0))
-
-        upsert_interval(
-            ts,
-            float(import_kwh or 0.0),
-            float(export_kwh or 0.0),
-            import_price,
-            export_price,
+        # Amber usage API expects startDate / endDate (not startTime / endTime)
+        usage = client._get(
+            f"sites/{site_id}/usage",
+            params={
+                "startDate": start,
+                "endDate": end,
+                "channelType": "general",
+                "resolution": "30m",
+            },
         )
-        count += 1
+    except Exception as e:
+        return {"status": "usage-error", "error": str(e)}
+
+    # Extract interval list
+    intervals = usage.get("data") if isinstance(usage, dict) else usage
+    if not intervals:
+        intervals = []
+
+    # --- Store results --------------------------------------------------------
+    for it in intervals:
+        ts = _parse_ts(it.get("interval_start") or it.get("start") or it.get("end"))
+        if not ts:
+            continue
+        import_kwh = float(it.get("kwh", 0.0))
+        export_kwh = 0.0
+
+        # Placeholder prices (until public plan API wired up)
+        import_price = 0.30
+        export_price = 0.10
+
+        upsert_interval(ts, import_kwh, export_kwh, import_price, export_price)
 
     db.session.commit()
-    return {"status": "ok", "count": count}
-
-
-def _parse_ts(val):
-    """Parse ISO8601 timestamp into datetime."""
-    if not val:
-        return None
-    try:
-        if isinstance(val, str):
-            if val.endswith("Z"):
-                return datetime.fromisoformat(val.replace("Z", "+00:00"))
-            return datetime.fromisoformat(val)
-        return val
-    except Exception:
-        return None
+    return {"status": "ok", "count": len(intervals)}
