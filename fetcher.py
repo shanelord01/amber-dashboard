@@ -5,12 +5,14 @@ import json
 
 API_BASE = "https://api.amber.com.au/v1"
 
+
 def get_headers(api_key):
     return {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
         "User-Agent": "Amber-Dashboard/1.0"
     }
+
 
 def get_site_id(api_key):
     """Discover Amber site_id automatically"""
@@ -25,8 +27,30 @@ def get_site_id(api_key):
     return None
 
 
-def pull_once(user):
-    """Pull and store interval data for one user"""
+def fetch_usage(api_key, site_id, channel_type, start_date, end_date):
+    """Fetch usage data for one channel and date range"""
+    url = (
+        f"{API_BASE}/sites/{site_id}/usage"
+        f"?channelType={channel_type}&startDate={start_date}&endDate={end_date}"
+    )
+    r = requests.get(url, headers=get_headers(api_key))
+    if r.status_code != 200:
+        print(f"[Amber] {channel_type} fetch failed {r.status_code}: {r.text}")
+        return []
+    try:
+        data = r.json()
+        if isinstance(data, list):
+            print(f"[Amber] {channel_type} returned {len(data)} records for {start_date} → {end_date}")
+        else:
+            print(f"[Amber] {channel_type} unexpected type: {type(data)}")
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[Amber] Error decoding {channel_type} JSON: {e}")
+        return []
+
+
+def pull_once(user, days_back=30):
+    """Pull and store interval data for one user in rolling 7-day batches (default 30 days)"""
     if not user.api_key:
         return {"status": "error", "error": "Missing API key"}
 
@@ -34,49 +58,31 @@ def pull_once(user):
     if not site_id:
         return {"status": "error", "error": "Missing site_id or API key"}
 
-    # Date range: last 7 days
     end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=7)
-    url = f"{API_BASE}/sites/{site_id}/usage?startDate={start_date}&endDate={end_date}"
-    print(f"[Amber] Fetching usage {start_date} → {end_date}")
+    start_date = end_date - timedelta(days=days_back)
 
-    r = requests.get(url, headers=get_headers(user.api_key))
-    if r.status_code != 200:
-        print(f"[Amber] Error {r.status_code}: {r.text}")
-        return {"status": "error", "error": r.text}
+    print(f"[Amber] Fetching usage {start_date} → {end_date} in 7-day batches")
 
-    data = r.json()
+    all_general, all_feed_in = [], []
 
-    # DEBUG: show sample
-    print("[Amber] Sample record from API:")
-    print(json.dumps(data[:3] if isinstance(data, list) else data, indent=2)[:1500])
+    # walk backward in 7-day slices
+    cursor = end_date
+    while cursor > start_date:
+        batch_end = cursor
+        batch_start = max(start_date, batch_end - timedelta(days=7))
+        cursor = batch_start
 
-    # Handle new (list) or old (dict) formats
-    general, feed_in = [], []
+        gen = fetch_usage(user.api_key, site_id, "general", batch_start, batch_end)
+        fin = fetch_usage(user.api_key, site_id, "feedIn", batch_start, batch_end)
+        all_general.extend(gen)
+        all_feed_in.extend(fin)
 
-    if isinstance(data, list):
-        # New format: list of channels
-        for ch in data:
-            ctype = ch.get("channelType", "").lower()
-            if "general" in ctype or "consumption" in ctype:
-                general.extend(ch.get("usage", []))
-            elif "feedin" in ctype or "export" in ctype:
-                feed_in.extend(ch.get("usage", []))
-    elif isinstance(data, dict):
-        general = data.get("general", [])
-        feed_in = data.get("feedIn", [])
-    else:
-        print("[Amber] Unexpected API structure.")
-        return {"status": "error", "error": "Unexpected API response type"}
+    print(f"[Amber] Total fetched: {len(all_general)} general, {len(all_feed_in)} feedIn")
 
-    print(f"[Amber] Received {len(general)} records for general")
-    print(f"[Amber] Received {len(feed_in)} records for feedIn")
-
-    # Map feed-in by timestamp
-    feed_in_map = {f["date"]: f for f in feed_in if "date" in f}
-
+    feed_in_map = {f["date"]: f for f in all_feed_in if "date" in f}
     count = 0
-    for g in general:
+
+    for g in all_general:
         try:
             ts = datetime.fromisoformat(g["date"].replace("Z", "+00:00"))
             import_kwh = float(g.get("kwh") or g.get("usageKwh") or 0)
@@ -94,7 +100,6 @@ def pull_once(user):
             )
             db.session.merge(interval)
             count += 1
-
         except Exception as e:
             print(f"[Amber] Error processing record: {e}")
 
